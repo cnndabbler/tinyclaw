@@ -253,11 +253,11 @@ function FeedEntry({ item }: { item: FeedItem }) {
           {eventType.replace(/_/g, " ")}
         </span>
         {d.responseText ? (
-          <p className="text-sm text-foreground mt-0.5 break-words whitespace-pre-wrap line-clamp-4">
-            {String(d.responseText).substring(0, 500)}
+          <p className="text-sm text-foreground mt-0.5 break-words whitespace-pre-wrap">
+            {String(d.responseText)}
           </p>
         ) : d.message ? (
-          <p className="text-sm text-muted-foreground mt-0.5 break-words truncate">
+          <p className="text-sm text-muted-foreground mt-0.5 break-words whitespace-pre-wrap">
             {String(d.message)}
           </p>
         ) : null}
