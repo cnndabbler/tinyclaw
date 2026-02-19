@@ -12,6 +12,7 @@ import path from 'path';
 import http from 'http';
 import { MessageData, ResponseData, Settings, AgentConfig, TeamConfig, Conversation } from './types';
 import {
+    SCRIPT_DIR, TINYCLAW_HOME,
     QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_PROCESSING,
     LOG_FILE, EVENTS_DIR, CHATS_DIR, SETTINGS_FILE,
     getSettings, getAgents, getTeams
@@ -67,6 +68,90 @@ function mutateSettings(fn: (settings: Settings) => void): Settings {
     fn(settings);
     fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2) + '\n');
     return settings;
+}
+
+// ── Agent workspace provisioning ─────────────────────────────────────────────
+
+function copyIfExists(src: string, dest: string): boolean {
+    if (!fs.existsSync(src)) return false;
+    if (fs.statSync(src).isDirectory()) {
+        fs.cpSync(src, dest, { recursive: true });
+    } else {
+        fs.copyFileSync(src, dest);
+    }
+    return true;
+}
+
+function symlinkIfMissing(target: string, linkPath: string): boolean {
+    if (!fs.existsSync(target)) return false;
+    if (fs.existsSync(linkPath)) return false;
+    fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+    fs.symlinkSync(target, linkPath);
+    return true;
+}
+
+/**
+ * Provision a new agent workspace — mirrors the logic from lib/agents.sh agent_add.
+ *
+ * Creates the agent directory and copies/symlinks configuration files:
+ *   .claude/, heartbeat.md, AGENTS.md, CLAUDE.md, skills, SOUL.md
+ */
+function provisionAgentWorkspace(agentDir: string, agentId: string): string[] {
+    const steps: string[] = [];
+    fs.mkdirSync(agentDir, { recursive: true });
+    steps.push(`Created directory ${agentDir}`);
+
+    // Copy .claude/ directory (or create empty)
+    const claudeSrc = path.join(SCRIPT_DIR, '.claude');
+    if (fs.existsSync(claudeSrc)) {
+        copyIfExists(claudeSrc, path.join(agentDir, '.claude'));
+        steps.push('Copied .claude/');
+    } else {
+        fs.mkdirSync(path.join(agentDir, '.claude'), { recursive: true });
+        steps.push('Created .claude/');
+    }
+
+    // Copy heartbeat.md
+    if (copyIfExists(path.join(SCRIPT_DIR, 'heartbeat.md'), path.join(agentDir, 'heartbeat.md'))) {
+        steps.push('Copied heartbeat.md');
+    }
+
+    // Copy AGENTS.md
+    const agentsMd = path.join(SCRIPT_DIR, 'AGENTS.md');
+    if (copyIfExists(agentsMd, path.join(agentDir, 'AGENTS.md'))) {
+        steps.push('Copied AGENTS.md');
+    }
+
+    // Copy AGENTS.md → .claude/CLAUDE.md
+    if (fs.existsSync(agentsMd)) {
+        fs.copyFileSync(agentsMd, path.join(agentDir, '.claude', 'CLAUDE.md'));
+        steps.push('Copied CLAUDE.md to .claude/');
+    }
+
+    // Resolve skills source
+    let skillsSrc = path.join(SCRIPT_DIR, '.agents', 'skills');
+    if (!fs.existsSync(skillsSrc)) {
+        skillsSrc = path.join(TINYCLAW_HOME, '.agents', 'skills');
+    }
+
+    if (fs.existsSync(skillsSrc)) {
+        // Symlink skills → .claude/skills
+        if (symlinkIfMissing(skillsSrc, path.join(agentDir, '.claude', 'skills'))) {
+            steps.push('Linked skills to .claude/skills/');
+        }
+        // Symlink skills → .agents/skills
+        if (symlinkIfMissing(skillsSrc, path.join(agentDir, '.agents', 'skills'))) {
+            steps.push('Linked skills to .agents/skills/');
+        }
+    }
+
+    // Create .tinyclaw/ and copy SOUL.md
+    fs.mkdirSync(path.join(agentDir, '.tinyclaw'), { recursive: true });
+    if (copyIfExists(path.join(SCRIPT_DIR, 'SOUL.md'), path.join(agentDir, '.tinyclaw', 'SOUL.md'))) {
+        steps.push('Copied SOUL.md to .tinyclaw/');
+    }
+
+    return steps;
 }
 
 // ── Server ───────────────────────────────────────────────────────────────────
@@ -262,19 +347,45 @@ export function startApiServer(
                 if (!body.name || !body.provider || !body.model) {
                     return jsonResponse(res, 400, { error: 'name, provider, and model are required' });
                 }
+
+                const currentSettings = getSettings();
+                const isNew = !currentSettings.agents?.[agentId];
+
+                // Auto-set working_directory to workspace_path/agent_id if not provided
+                const workspacePath = currentSettings.workspace?.path
+                    || path.join(require('os').homedir(), 'tinyclaw-workspace');
+                const workingDir = body.working_directory || path.join(workspacePath, agentId);
+
                 const settings = mutateSettings(s => {
                     if (!s.agents) s.agents = {};
                     s.agents[agentId] = {
                         name: body.name!,
                         provider: body.provider!,
                         model: body.model!,
-                        working_directory: body.working_directory || '',
+                        working_directory: workingDir,
                         ...(body.system_prompt ? { system_prompt: body.system_prompt } : {}),
                         ...(body.prompt_file ? { prompt_file: body.prompt_file } : {}),
                     };
                 });
+
+                // Provision workspace for new agents
+                let provisionSteps: string[] = [];
+                if (isNew) {
+                    try {
+                        provisionSteps = provisionAgentWorkspace(workingDir, agentId);
+                        log('INFO', `[API] Agent '${agentId}' provisioned: ${provisionSteps.join(', ')}`);
+                    } catch (err) {
+                        log('ERROR', `[API] Agent '${agentId}' provisioning failed: ${(err as Error).message}`);
+                    }
+                }
+
                 log('INFO', `[API] Agent '${agentId}' saved`);
-                return jsonResponse(res, 200, { ok: true, agent: settings.agents![agentId] });
+                return jsonResponse(res, 200, {
+                    ok: true,
+                    agent: settings.agents![agentId],
+                    provisioned: isNew,
+                    provisionSteps,
+                });
             }
 
             // ── DELETE /api/agents/:id — Delete an agent ─────────────────
