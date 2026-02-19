@@ -78,8 +78,8 @@ export default function ConsolePage() {
     try {
       const result = await sendMessage({
         message: finalMessage,
-        sender: "Mission Control",
-        channel: "mission-control",
+        sender: "Web",
+        channel: "web",
       });
 
       setFeed((prev) => [

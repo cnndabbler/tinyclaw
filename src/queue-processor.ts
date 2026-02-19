@@ -16,16 +16,16 @@
 
 import fs from 'fs';
 import path from 'path';
-import http from 'http';
-import { MessageData, ResponseData, QueueFile, ChainStep, Conversation, TeamConfig, Settings } from './lib/types';
+import { MessageData, ResponseData, QueueFile, ChainStep, Conversation, TeamConfig } from './lib/types';
 import {
     QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_PROCESSING,
-    LOG_FILE, EVENTS_DIR, CHATS_DIR, FILES_DIR, SETTINGS_FILE,
+    LOG_FILE, EVENTS_DIR, CHATS_DIR, FILES_DIR,
     getSettings, getAgents, getTeams
 } from './lib/config';
 import { log, emitEvent } from './lib/logging';
 import { parseAgentRouting, findTeamForAgent, getAgentResetFlag, extractTeammateMentions } from './lib/routing';
 import { invokeAgent } from './lib/invoke';
+import { startApiServer } from './api-server';
 import { jsonrepair } from 'jsonrepair';
 
 /** Parse JSON with automatic repair for malformed content (e.g. bad escapes). */
@@ -592,241 +592,10 @@ if (!fs.existsSync(EVENTS_DIR)) {
     fs.mkdirSync(EVENTS_DIR, { recursive: true });
 }
 
-// ─── HTTP API Server ────────────────────────────────────────────────────────
+// ─── Start ──────────────────────────────────────────────────────────────────
 
-const API_PORT = parseInt(process.env.TINYCLAW_API_PORT || '3001', 10);
-
-/** Collect SSE clients for real-time event streaming. */
-const sseClients = new Set<http.ServerResponse>();
-
-/** Read the full body of an incoming request. */
-function readBody(req: http.IncomingMessage): Promise<string> {
-    return new Promise((resolve, reject) => {
-        const chunks: Buffer[] = [];
-        req.on('data', (chunk: Buffer) => chunks.push(chunk));
-        req.on('end', () => resolve(Buffer.concat(chunks).toString()));
-        req.on('error', reject);
-    });
-}
-
-/** Send a JSON response. */
-function jsonResponse(res: http.ServerResponse, status: number, body: unknown): void {
-    const payload = JSON.stringify(body);
-    res.writeHead(status, {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
-    });
-    res.end(payload);
-}
-
-/** Broadcast an event to all SSE clients. */
-function broadcastSSE(event: string, data: unknown): void {
-    const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-    for (const client of sseClients) {
-        try { client.write(message); } catch { sseClients.delete(client); }
-    }
-}
-
-/** Wrap emitEvent to also broadcast via SSE. */
-const _originalEmitEvent = emitEvent;
-function emitEventWithSSE(type: string, data: Record<string, unknown>): void {
-    _originalEmitEvent(type, data);
-    broadcastSSE(type, { type, timestamp: Date.now(), ...data });
-}
-
-// Patch the emitEvent calls — override the imported binding
-// We'll use a module-level wrapper instead
-const emitEventSSE = emitEventWithSSE;
-
-const apiServer = http.createServer(async (req, res) => {
-    // CORS preflight
-    if (req.method === 'OPTIONS') {
-        res.writeHead(204, {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type',
-        });
-        res.end();
-        return;
-    }
-
-    const url = new URL(req.url || '/', `http://localhost:${API_PORT}`);
-    const pathname = url.pathname;
-
-    try {
-        // ── POST /api/message — Enqueue a new message ───────────────────
-        if (req.method === 'POST' && pathname === '/api/message') {
-            const body = JSON.parse(await readBody(req));
-            const { message, agent, sender, channel } = body as {
-                message?: string; agent?: string; sender?: string; channel?: string;
-            };
-
-            if (!message || typeof message !== 'string') {
-                return jsonResponse(res, 400, { error: 'message is required' });
-            }
-
-            const messageData: MessageData = {
-                channel: channel || 'mission-control',
-                sender: sender || 'Mission Control',
-                message,
-                timestamp: Date.now(),
-                messageId: `mc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-                agent: agent || undefined,
-            };
-
-            const filename = `mc_${messageData.messageId}.json`;
-            fs.writeFileSync(path.join(QUEUE_INCOMING, filename), JSON.stringify(messageData, null, 2));
-
-            log('INFO', `[API] Message enqueued: ${message.substring(0, 60)}...`);
-            broadcastSSE('message_enqueued', { messageId: messageData.messageId, agent, message: message.substring(0, 120) });
-
-            return jsonResponse(res, 200, { ok: true, messageId: messageData.messageId });
-        }
-
-        // ── GET /api/agents — List all agents ───────────────────────────
-        if (req.method === 'GET' && pathname === '/api/agents') {
-            const settings = getSettings();
-            const agents = getAgents(settings);
-            return jsonResponse(res, 200, agents);
-        }
-
-        // ── GET /api/teams — List all teams ─────────────────────────────
-        if (req.method === 'GET' && pathname === '/api/teams') {
-            const settings = getSettings();
-            const teams = getTeams(settings);
-            return jsonResponse(res, 200, teams);
-        }
-
-        // ── GET /api/settings — Get current settings ────────────────────
-        if (req.method === 'GET' && pathname === '/api/settings') {
-            const settings = getSettings();
-            return jsonResponse(res, 200, settings);
-        }
-
-        // ── PUT /api/settings — Update settings ─────────────────────────
-        if (req.method === 'PUT' && pathname === '/api/settings') {
-            const body = JSON.parse(await readBody(req));
-            // Merge with existing settings
-            const current = getSettings();
-            const merged = { ...current, ...body } as Settings;
-            fs.writeFileSync(SETTINGS_FILE, JSON.stringify(merged, null, 2) + '\n');
-            log('INFO', '[API] Settings updated');
-            return jsonResponse(res, 200, { ok: true, settings: merged });
-        }
-
-        // ── GET /api/queue/status — Queue status ────────────────────────
-        if (req.method === 'GET' && pathname === '/api/queue/status') {
-            const incoming = fs.readdirSync(QUEUE_INCOMING).filter(f => f.endsWith('.json')).length;
-            const processing = fs.readdirSync(QUEUE_PROCESSING).filter(f => f.endsWith('.json')).length;
-            const outgoing = fs.readdirSync(QUEUE_OUTGOING).filter(f => f.endsWith('.json')).length;
-            const activeConversations = conversations.size;
-            return jsonResponse(res, 200, { incoming, processing, outgoing, activeConversations });
-        }
-
-        // ── GET /api/responses — Recent outgoing responses ──────────────
-        if (req.method === 'GET' && pathname === '/api/responses') {
-            const limit = parseInt(url.searchParams.get('limit') || '20', 10);
-            const files = fs.readdirSync(QUEUE_OUTGOING)
-                .filter(f => f.endsWith('.json'))
-                .map(f => ({ name: f, time: fs.statSync(path.join(QUEUE_OUTGOING, f)).mtimeMs }))
-                .sort((a, b) => b.time - a.time)
-                .slice(0, limit);
-
-            const responses: ResponseData[] = [];
-            for (const file of files) {
-                try {
-                    const data = JSON.parse(fs.readFileSync(path.join(QUEUE_OUTGOING, file.name), 'utf8'));
-                    responses.push(data);
-                } catch { /* skip bad files */ }
-            }
-            return jsonResponse(res, 200, responses);
-        }
-
-        // ── GET /api/events/stream — Server-Sent Events ─────────────────
-        if (req.method === 'GET' && pathname === '/api/events/stream') {
-            res.writeHead(200, {
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-                'Access-Control-Allow-Origin': '*',
-            });
-            res.write(`event: connected\ndata: ${JSON.stringify({ timestamp: Date.now() })}\n\n`);
-            sseClients.add(res);
-            req.on('close', () => sseClients.delete(res));
-            return; // keep connection open
-        }
-
-        // ── GET /api/events — Recent events (polling) ───────────────────
-        if (req.method === 'GET' && pathname === '/api/events') {
-            const since = parseInt(url.searchParams.get('since') || '0', 10);
-            const limit = parseInt(url.searchParams.get('limit') || '50', 10);
-
-            const eventFiles = fs.readdirSync(EVENTS_DIR)
-                .filter(f => f.endsWith('.json'))
-                .map(f => {
-                    const ts = parseInt(f.split('-')[0], 10);
-                    return { name: f, ts };
-                })
-                .filter(f => f.ts > since)
-                .sort((a, b) => b.ts - a.ts)
-                .slice(0, limit);
-
-            const events: unknown[] = [];
-            for (const file of eventFiles) {
-                try {
-                    const data = JSON.parse(fs.readFileSync(path.join(EVENTS_DIR, file.name), 'utf8'));
-                    events.push(data);
-                } catch { /* skip */ }
-            }
-            return jsonResponse(res, 200, events);
-        }
-
-        // ── GET /api/logs — Recent log lines ────────────────────────────
-        if (req.method === 'GET' && pathname === '/api/logs') {
-            const limit = parseInt(url.searchParams.get('limit') || '100', 10);
-            try {
-                const logContent = fs.readFileSync(LOG_FILE, 'utf8');
-                const lines = logContent.trim().split('\n').slice(-limit);
-                return jsonResponse(res, 200, { lines });
-            } catch {
-                return jsonResponse(res, 200, { lines: [] });
-            }
-        }
-
-        // ── GET /api/chats — List chat histories ────────────────────────
-        if (req.method === 'GET' && pathname === '/api/chats') {
-            const chats: { teamId: string; file: string; time: number }[] = [];
-            if (fs.existsSync(CHATS_DIR)) {
-                for (const teamDir of fs.readdirSync(CHATS_DIR)) {
-                    const teamPath = path.join(CHATS_DIR, teamDir);
-                    if (fs.statSync(teamPath).isDirectory()) {
-                        for (const file of fs.readdirSync(teamPath).filter(f => f.endsWith('.md'))) {
-                            const time = fs.statSync(path.join(teamPath, file)).mtimeMs;
-                            chats.push({ teamId: teamDir, file, time });
-                        }
-                    }
-                }
-            }
-            chats.sort((a, b) => b.time - a.time);
-            return jsonResponse(res, 200, chats);
-        }
-
-        // ── 404 ─────────────────────────────────────────────────────────
-        jsonResponse(res, 404, { error: 'Not found' });
-
-    } catch (error) {
-        log('ERROR', `[API] ${(error as Error).message}`);
-        jsonResponse(res, 500, { error: 'Internal server error' });
-    }
-});
-
-apiServer.listen(API_PORT, () => {
-    log('INFO', `API server listening on http://localhost:${API_PORT}`);
-});
-
-// ─── Main loop ──────────────────────────────────────────────────────────────
+// Start the API server (passes conversations for queue status reporting)
+const apiServer = startApiServer(conversations);
 
 log('INFO', 'Queue processor started');
 recoverOrphanedFiles();
